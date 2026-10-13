@@ -1,0 +1,315 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+library(igraph)
+library(scales)
+output_dir <- file.path("results", "behavior_network")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_plot_bundle <- function(plot, stem, width = 5, height = 5, dpi = 300) {
+  svglite::svglite(file.path(output_dir, paste0(stem, ".svg")), width = width, height = height, bg = "transparent")
+  print(plot)
+  grDevices::dev.off()
+  grDevices::cairo_pdf(file.path(output_dir, paste0(stem, ".pdf")), width = width, height = height, family = "Arial")
+  print(plot)
+  grDevices::dev.off()
+  ragg::agg_png(file.path(output_dir, paste0(stem, ".png")), width = width, height = height, units = "in", res = dpi)
+  print(plot)
+  grDevices::dev.off()
+}
+```
+
+## Load Data
+```{r load-data}
+load(file.path("..", "..", "data", "data_agg", "post_final.Rdata"))
+load(file.path("..", "..", "data", "data_agg", "SNmF_igraph.Rdata"))
+```
+
+## Shared Settings
+```{r shared-settings}
+behavior_vars <- c("BE", "BE_TP", "BEE", "BEE_TP", "donate", "RD", "TG", "TPP")
+corruption_vars <- c("BE", "BE_TP", "BEE", "BEE_TP")
+filler_vars <- c("donate", "RD", "TG", "TPP")
+
+network_names <- c(
+  "Friendship",
+  "Daily-activity",
+  "Personal life-sharing",
+  "Gossip-sharing",
+  "Positive-cooperation",
+  "Negative-cooperation"
+)
+
+network_colors <- setNames(
+  c("#C77CFF", "#4DA6FF", "#F8766D", "#FFB74D", "#66BB6A", "#9E9E9E"),
+  network_names
+)
+```
+
+## Prepare Behavioral Data
+```{r behavior-data}
+if (nrow(post_final) != 113L) {
+  stop("post_final must contain 113 complete participants.")
+}
+
+behavior_data <- post_final %>%
+  select(node_id, all_of(behavior_vars))
+
+behavior_long <- behavior_data %>%
+  pivot_longer(
+    cols = all_of(behavior_vars),
+    names_to = "behavior",
+    values_to = "score"
+  ) %>%
+  mutate(
+    type = if_else(behavior %in% corruption_vars, "Corruption", "Filler"),
+    behavior = factor(behavior, levels = behavior_vars)
+  )
+```
+
+## Behavioral Descriptive Statistics
+```{r behavior-descriptive-statistics}
+descriptive_stats <- behavior_long %>%
+  group_by(behavior, type) %>%
+  summarise(
+    n = sum(!is.na(score)),
+    M = mean(score, na.rm = TRUE),
+    SD = sd(score, na.rm = TRUE),
+    Median = median(score, na.rm = TRUE),
+    IQR = IQR(score, na.rm = TRUE),
+    Min = min(score, na.rm = TRUE),
+    Max = max(score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(c(M, SD, Median, IQR, Min, Max), ~ round(.x, 2))
+  )
+
+descriptive_stats
+```
+
+## Prepare Behavioral Plot Data
+```{r behavior-plot-data}
+corruption_long <- behavior_long %>%
+  filter(type == "Corruption") %>%
+  mutate(
+    behavior = factor(
+      behavior,
+      levels = corruption_vars,
+      labels = c("a", " b", " c", " d")
+    )
+  )
+
+filler_long <- behavior_long %>%
+  filter(type == "Filler") %>%
+  mutate(
+    behavior = factor(
+      behavior,
+      levels = filler_vars,
+      labels = c(" a", " b", " c", " d")
+    )
+  )
+```
+
+## Behavioral Plotting Function
+```{r behavior-plot-function}
+make_violin_plot <- function(data, violin_fill, box_fill, point_color) {
+  ggplot(data, aes(x = behavior, y = score)) +
+    geom_violin(
+      trim = FALSE,
+      alpha = 0.5,
+      color = NA,
+      fill = violin_fill,
+      width = 0.8
+    ) +
+    geom_boxplot(
+      width = 0.16,
+      outlier.shape = NA,
+      alpha = 0.85,
+      color = "grey40",
+      fill = box_fill
+    ) +
+    geom_jitter(
+      width = 0.10,
+      alpha = 0.45,
+      size = 2.4,
+      shape = 16,
+      color = point_color
+    ) +
+    scale_y_continuous(
+      limits = c(0, 100),
+      breaks = seq(0, 100, 20),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    labs(
+      x = NULL,
+      y = ""
+    ) +
+    coord_fixed(ratio = 1 / 20) +
+    theme_classic(base_size = 13, base_family = "Arial") +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_blank(),
+      aspect.ratio = 1
+    )
+}
+```
+
+## Corruption Behavior Plot
+```{r corruption-behavior-plot}
+p_corruption <- make_violin_plot(
+  data = corruption_long,
+  violin_fill = "#FDBE85",
+  box_fill = "#FD8D3C",
+  point_color = "#D95F02"
+)
+
+p_corruption
+
+save_plot_bundle(p_corruption, "corruption_behavior_violin")
+```
+
+## Filler Behavior Plot
+
+```{r filler-behavior-plot}
+p_filler <- make_violin_plot(
+  data = filler_long,
+  violin_fill = "#9ECAE1",
+  box_fill = "#6BAED6",
+  point_color = "#4292C6"
+)
+
+p_filler
+
+save_plot_bundle(p_filler, "filler_behavior_violin")
+```
+
+## Prepare Network Data
+```{r network-data}
+graph_list <- setNames(
+  list(
+    SNmF_igraph[[1]],
+    SNmF_igraph[[2]],
+    SNmF_igraph[[3]],
+    SNmF_igraph[[4]],
+    SNmF_igraph[[5]],
+    SNmF_igraph[[6]]
+  ),
+  network_names
+)
+```
+
+## Construct the Shared Network
+```{r network-shared-layout}
+all_nodes <- V(graph_list[[1]])$name
+
+union_graph <- make_empty_graph(n = length(all_nodes), directed = TRUE)
+V(union_graph)$name <- all_nodes
+
+for (graph in graph_list) {
+  edge_list <- as_edgelist(graph, names = TRUE)
+  if (nrow(edge_list) > 0) {
+    union_graph <- add_edges(union_graph, t(edge_list))
+  }
+}
+
+union_graph <- simplify(union_graph, remove.multiple = TRUE, remove.loops = TRUE)
+```
+
+## Network Layout Function
+```{r network-layout-function}
+resolve_overlaps <- function(pos, min_dist = 0.06, iter = 300, move_frac = 0.6) {
+  n <- nrow(pos)
+  for (it in seq_len(iter)) {
+    distance_matrix <- as.matrix(stats::dist(pos))
+    distance_matrix[lower.tri(distance_matrix, diag = TRUE)] <- Inf
+    nearby_pairs <- which(distance_matrix < min_dist, arr.ind = TRUE)
+    if (nrow(nearby_pairs) == 0) break
+    for (k in seq_len(nrow(nearby_pairs))) {
+      i <- nearby_pairs[k, 1]
+      j <- nearby_pairs[k, 2]
+      delta <- pos[i, ] - pos[j, ]
+      distance <- sqrt(sum(delta^2))
+      if (distance == 0) {
+        delta <- runif(2, -0.01, 0.01)
+        distance <- sqrt(sum(delta^2))
+      }
+      shift <- ((min_dist - distance) / 2) * (delta / distance)
+      pos[i, ] <- pos[i, ] + shift * move_frac
+      pos[j, ] <- pos[j, ] - shift * move_frac
+    }
+  }
+  pos
+}
+```
+
+## Compute the Shared Layout
+```{r network-layout}
+set.seed(1234)
+shared_layout <- layout_with_fr(
+  union_graph,
+  niter = 2000,
+  area = vcount(union_graph)^2 * 8,
+  repulserad = vcount(union_graph)^2 * 8
+)
+shared_layout[, 1] <- shared_layout[, 1] * 1.5
+
+shared_layout <- resolve_overlaps(shared_layout, min_dist = 0.06, iter = 300, move_frac = 0.6)
+shared_layout <- norm_coords(shared_layout, xmin = -1.2, xmax = 1.2, ymin = -0.9, ymax = 0.9)
+rownames(shared_layout) <- V(union_graph)$name
+```
+
+## In-degree Range
+```{r network-indegree-range}
+all_indegree <- unlist(lapply(graph_list, function(graph) degree(graph, mode = "in")))
+global_indegree_range <- range(all_indegree)
+
+global_indegree_range
+```
+
+## Network Plotting Function
+```{r network-plot-function}
+plot_network_file <- function(network_index, filename, device = c("svg", "pdf", "png"), dpi = 300) {
+  device <- match.arg(device)
+  if (device == "svg") svglite::svglite(filename, width = 12, height = 12, bg = "transparent")
+  if (device == "pdf") grDevices::cairo_pdf(filename, width = 12, height = 12, family = "Arial")
+  if (device == "png") ragg::agg_png(filename, width = 12, height = 12, units = "in", res = dpi)
+  on.exit(dev.off(), add = TRUE)
+
+  network_name <- names(graph_list)[network_index]
+  graph <- graph_list[[network_index]]
+  plot_layout <- shared_layout[V(graph)$name, , drop = FALSE]
+  par(mfrow = c(1, 1), bg = NA, family = "Arial")
+  layout(1)
+
+  plot_layout[, 1] <- plot_layout[, 1] * 0.8
+  plot_layout[, 2] <- plot_layout[, 2] * 0.8
+
+  indegree <- degree(graph, mode = "in")
+  vertex_size <- scales::rescale(indegree, to = c(3, 10), from = global_indegree_range)
+
+  plot(
+    graph,
+    layout = plot_layout,
+    rescale = FALSE,
+    xlim = range(plot_layout[, 1]),
+    ylim = range(plot_layout[, 2]),
+    margin = -0.3,
+    vertex.size = vertex_size,
+    vertex.color = scales::alpha(network_colors[network_name], 0.88),
+    vertex.frame.color = NA,
+    vertex.label = NA,
+    edge.color = scales::alpha("grey40", 0.45),
+    edge.arrow.size = 0.10,
+    edge.width = 2,
+    edge.curved = 0.02,
+    main = ""
+  )
+}
+```
+
+## Export Network Plot
+```{r export-network-plot}
+plot_network_file(1, file.path(output_dir, "network_1.svg"), "svg")
+plot_network_file(1, file.path(output_dir, "network_1.pdf"), "pdf")
+plot_network_file(1, file.path(output_dir, "network_1.png"), "png")
+```

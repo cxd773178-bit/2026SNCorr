@@ -1,0 +1,199 @@
+```{r setup, include=FALSE}
+library(tidyverse)
+output_dir <- file.path("results", "jaccard")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_plot_bundle <- function(plot, stem, width, height, dpi = 300) {
+  svglite::svglite(file.path(output_dir, paste0(stem, ".svg")), width = width, height = height, bg = "transparent")
+  print(plot)
+  grDevices::dev.off()
+  grDevices::cairo_pdf(file.path(output_dir, paste0(stem, ".pdf")), width = width, height = height, family = "Arial")
+  print(plot)
+  grDevices::dev.off()
+  ragg::agg_png(file.path(output_dir, paste0(stem, ".png")), width = width, height = height, units = "in", res = dpi)
+  print(plot)
+  grDevices::dev.off()
+}
+```
+
+## Load Data
+```{r load-data}
+load(file.path("..", "..", "data", "data_agg", "SNmF_all_agg.Rdata"))
+```
+
+## Network Labels
+```{r shared-settings}
+network_names <- c(
+  "Friendship",
+  "Daily-activity",
+  "Personal life-sharing",
+  "Gossip-sharing",
+  "Positive-cooperation",
+  "Negative-cooperation"
+)
+```
+
+## Prepare Network Matrices
+```{r build-network-list}
+if (!is.list(SNmF_all_agg) || length(SNmF_all_agg) != length(network_names)) {
+  stop("SNmF_all_agg must contain six network matrices.")
+}
+network_matrices <- setNames(SNmF_all_agg, network_names)
+```
+
+## Jaccard Similarity Function
+```{r jaccard-function}
+jaccard_vec <- function(mat_a, mat_b) {
+  if (!all(dim(mat_a) == dim(mat_b))) {
+    stop("mat_a and mat_b must have the same dimensions.")
+  }
+
+  n <- nrow(mat_a)
+  jaccard <- numeric(n)
+
+  for (i in seq_len(n)) {
+    a_neighbors <- which(mat_a[i, ] == 1)
+    b_neighbors <- which(mat_b[i, ] == 1)
+    union_neighbors <- union(a_neighbors, b_neighbors)
+
+    if (length(union_neighbors) == 0) {
+      jaccard[i] <- NA
+    } else {
+      jaccard[i] <- length(intersect(a_neighbors, b_neighbors)) / length(union_neighbors)
+    }
+  }
+
+  jaccard
+}
+```
+
+## Pairwise Jaccard Similarities
+```{r pairwise-jaccard}
+jaccard_results_list <- list()
+matrices <- network_matrices
+n_networks <- length(matrices)
+
+for (a in seq_len(n_networks - 1)) {
+  for (b in (a + 1):n_networks) {
+    jaccard <- jaccard_vec(matrices[[a]], matrices[[b]])
+
+    jaccard_results_list[[length(jaccard_results_list) + 1]] <- data.frame(
+      netA = names(matrices)[a],
+      netB = names(matrices)[b],
+      student = rownames(matrices[[a]]),
+      jaccard = jaccard
+    )
+  }
+}
+
+jaccard_results <- bind_rows(jaccard_results_list)
+
+```
+
+## Pairwise Summary
+```{r pairwise-summary}
+jaccard_summary <- jaccard_results %>%
+  group_by(netA, netB) %>%
+  summarise(
+    mean_jacc = mean(jaccard, na.rm = TRUE),
+    sd_jacc = sd(jaccard, na.rm = TRUE),
+    n_valid = sum(!is.na(jaccard)),
+    .groups = "drop"
+  )
+
+```
+
+## Display Pairwise Summary
+```{r pairwise-summary-output}
+jaccard_summary
+```
+
+## Jaccard Matrix Function
+```{r heatmap-matrix-function}
+make_symmetric_jaccard_matrix <- function(summary_data, value_col, networks) {
+  jaccard_matrix <- matrix(NA, nrow = length(networks), ncol = length(networks))
+  dimnames(jaccard_matrix) <- list(networks, networks)
+  diag(jaccard_matrix) <- 1
+
+  for (i in seq_len(nrow(summary_data))) {
+    net_a <- summary_data$netA[i]
+    net_b <- summary_data$netB[i]
+    value <- summary_data[[value_col]][i]
+    jaccard_matrix[net_a, net_b] <- value
+    jaccard_matrix[net_b, net_a] <- value
+  }
+
+  jaccard_matrix[upper.tri(jaccard_matrix, diag = TRUE)] <- NA
+  jaccard_matrix
+}
+```
+
+## Prepare Heatmap Data
+```{r mean-heatmap-data}
+jaccard_matrix_mean <- make_symmetric_jaccard_matrix(
+  summary_data = jaccard_summary,
+  value_col = "mean_jacc",
+  networks = network_names
+)
+
+jaccard_plot_data <- as.data.frame(as.table(jaccard_matrix_mean))
+colnames(jaccard_plot_data) <- c("network1", "network2", "r")
+jaccard_plot_data$network1 <- factor(jaccard_plot_data$network1, levels = rev(network_names))
+jaccard_plot_data$network2 <- factor(jaccard_plot_data$network2, levels = network_names)
+```
+
+## Jaccard Heatmap
+```{r mean-heatmap}
+jaccard_heatmap <- ggplot(jaccard_plot_data, aes(x = network2, y = network1, fill = r)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  geom_text(
+    aes(label = ifelse(is.na(r), "", sprintf("%.2f", round(r, 2)))),
+    size = 4.3, color = "black"
+  ) +
+  scale_fill_gradient(low = "#FAF0E6", high = "#FF7F00", na.value = "white") +
+  coord_fixed() +
+  labs(title = "Mean Jaccard Heatmap") +
+  theme_minimal(base_size = 15, base_family = "Arial") +
+  theme(
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "right",
+    legend.margin = margin(0, 0, 0, 0),
+    legend.box.margin = margin(0, -50, 0, -50),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+jaccard_heatmap
+save_plot_bundle(jaccard_heatmap, "mean_jaccard_heatmap", width = 7, height = 6)
+write.csv(jaccard_summary, file.path(output_dir, "jaccard_pairwise_summary.csv"), row.names = FALSE)
+```
+
+## Network-level Summary
+```{r per-network-summary}
+per_student <- jaccard_results %>%
+  pivot_longer(
+    cols = c(netA, netB),
+    names_to = "role",
+    values_to = "network"
+  ) %>%
+  group_by(student, network) %>%
+  summarise(
+    subj_mean_jacc = mean(jaccard, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summary_per_network <- per_student %>%
+  group_by(network) %>%
+  summarise(
+    mean_jacc = mean(subj_mean_jacc, na.rm = TRUE),
+    sd_jacc = sd(subj_mean_jacc, na.rm = TRUE),
+    n_valid = sum(!is.na(subj_mean_jacc)),
+    .groups = "drop"
+  )
+
+summary_per_network
+write.csv(summary_per_network, file.path(output_dir, "jaccard_network_summary.csv"), row.names = FALSE)
+```

@@ -1,0 +1,16 @@
+"netA","netB","mean_jacc","sd_jacc","n_valid"
+"Daily-activity","Gossip-sharing",0.457180650037793,0.418239699310261,105
+"Daily-activity","Negative-cooperation",0.248602092352092,0.368131424175986,88
+"Daily-activity","Personal life-sharing",0.528927545441307,0.41346777603542,109
+"Daily-activity","Positive-cooperation",0.366405020939795,0.368794359548056,112
+"Friendship","Daily-activity",0.501119916152596,0.394984228725086,108
+"Friendship","Gossip-sharing",0.525179771209183,0.383938805628546,110
+"Friendship","Negative-cooperation",0.20713591963592,0.347265510948175,106
+"Friendship","Personal life-sharing",0.622109455932985,0.352030535080056,111
+"Friendship","Positive-cooperation",0.50170836884788,0.352335310916299,113
+"Gossip-sharing","Negative-cooperation",0.256666666666667,0.388083987380511,95
+"Gossip-sharing","Positive-cooperation",0.427376804350489,0.38053899880042,111
+"Personal life-sharing","Gossip-sharing",0.657017275177653,0.380683994768496,106
+"Personal life-sharing","Negative-cooperation",0.221863494760691,0.356534870055005,107
+"Personal life-sharing","Positive-cooperation",0.464083458957132,0.365987384775196,112
+"Positive-cooperation","Negative-cooperation",0.162210070631123,0.305204548223132,110

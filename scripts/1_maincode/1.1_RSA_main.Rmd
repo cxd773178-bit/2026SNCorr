@@ -1,0 +1,527 @@
+---
+title: "IS-RSA analysis for social network and bribery behavior"
+output: html_document
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+# Analysis constants ----------------------------------------------------------
+n_net <- 6
+net_ind <- c("indegree", "outdegree", "betweenness", "eigen")
+
+bribery_behav <- c("BE", "BE_TP", "BEE", "BEE_TP")
+filler_behav <- c("donate", "RD", "TG", "TPP")
+
+scaling <- "none"
+rsa_dist <- "euclidean"
+seed_value <- 27
+
+# Defaults reproduce the manuscript analyses. Override these environment
+# variables only for quick code checks.
+n_perm_lmer <- as.integer(Sys.getenv("RSA_LMER_PERM", "2000"))
+n_perm_mantel <- as.integer(Sys.getenv("RSA_MANTEL_PERM", "5000"))
+
+source("../0_preprocessing/0.i_import_data.R", local = TRUE)
+source("1.0_RDM_helpers.R", local = TRUE)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(igraph)
+library(lme4)
+library(lmerTest)
+
+if (rsa_dist == "euclidean") {
+  post_final[, net_index_all] <- scale(post_final[, net_index_all])
+}
+
+# Keep RDM row/column labels aligned with the filtered participant order.
+rownames(post_final) <- as.character(seq_len(nrow(post_final)))
+id_levels <- rownames(post_final)
+participant_ids <- as.character(post_final$node_id)
+
+network_cats <- c("fr", "da", "si", "oi", "pc", "nc")
+network_names <- c(
+  "Friendship",
+  "Daily-activity",
+  "Personal life-sharing",
+  "Gossip-sharing",
+  "Positive-cooperation",
+  "Negative-cooperation"
+)
+names(network_names) <- network_cats
+
+network_cols <- paste0("network.", network_cats)
+distance_cols <- paste0("distance.", network_cats)
+
+behavior_labels <- c(
+  BE = "TT_abs",
+  BE_TP = "TT_pres",
+  BEE = "J_abs",
+  BEE_TP = "J_pres"
+)
+
+centrality_labels <- c(
+  indegree = "In-degree",
+  outdegree = "Out-degree",
+  betweenness = "Betweenness",
+  eigen = "Eigenvector"
+)
+
+plot_data_dir <- file.path("..", "99_visualization", "results", "rsa")
+dir.create(plot_data_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Helper Functions
+
+```{r helper-functions}
+make_rdm <- function(df, which_dist = rsa_dist, scale_output = TRUE) {
+  out <- df %>%
+    my_RDM(which_dist = which_dist) %>%
+    filter(var1 < var2) %>%
+    arrange(var1, var2) %>%
+    mutate(dist = as.numeric(dist))
+
+  if (scale_output) {
+    out <- out %>% mutate(dist = as.numeric(scale(dist)))
+  }
+
+  out
+}
+
+fit_rdm_model <- function(df, y_col, x_cols) {
+  formula <- as.formula(
+    paste0(y_col, " ~ ", paste(x_cols, collapse = " + "), " + (1 | var1) + (1 | var2)")
+  )
+  lmerTest::lmer(formula, data = df, REML = FALSE)
+}
+
+extract_lmer_results <- function(model, digits = 4) {
+  coefs <- coef(summary(model))
+  p_col <- grep("^Pr\\(", colnames(coefs), value = TRUE)
+  p_value <- if (length(p_col) == 1) coefs[, p_col] else NA_real_
+  ci <- suppressMessages(confint(model, method = "Wald", parm = "beta_"))
+  ci <- ci[match(rownames(coefs), rownames(ci)), , drop = FALSE]
+
+  tibble(
+    term = rownames(coefs),
+    beta = coefs[, "Estimate"],
+    SE = coefs[, "Std. Error"],
+    LL = ci[, 1],
+    UL = ci[, 2],
+    t = coefs[, "t value"],
+    p = p_value
+  ) %>%
+    mutate(
+      across(c(beta, SE, LL, UL, t), ~ round(.x, digits)),
+      p = ifelse(p < .001, "< .001", sprintf(paste0("%.", digits, "f"), p))
+    )
+}
+
+RDM_regression_perm <- function(df, x_cols, y_col, B = 2000, seed = seed_value) {
+  ids <- sort(unique(c(as.character(df$var1), as.character(df$var2))))
+  n_subjects <- length(ids)
+  i <- match(as.character(df$var1), ids)
+  j <- match(as.character(df$var2), ids)
+
+  y_mat <- matrix(NA_real_, n_subjects, n_subjects, dimnames = list(ids, ids))
+  y_mat[cbind(i, j)] <- df[[y_col]]
+  y_mat[cbind(j, i)] <- df[[y_col]]
+  diag(y_mat) <- 0
+
+  model <- fit_rdm_model(df, y_col, x_cols)
+  beta_obs <- coef(summary(model))[x_cols, "Estimate"]
+
+  set.seed(seed)
+  perm_beta <- matrix(NA_real_, nrow = length(x_cols), ncol = B, dimnames = list(x_cols, NULL))
+
+  for (b in seq_len(B)) {
+    perm_id <- sample.int(n_subjects)
+    df_perm <- df
+    df_perm[[y_col]] <- y_mat[perm_id, perm_id][cbind(i, j)]
+
+    perm_model <- fit_rdm_model(df_perm, y_col, x_cols)
+    perm_beta[, b] <- coef(summary(perm_model))[x_cols, "Estimate"]
+
+    if (B >= 200 && b %% 200 == 0) message("Permutation ", b, "/", B)
+  }
+
+  tibble(
+    term = x_cols,
+    beta_obs = as.numeric(beta_obs),
+    p_perm = map_dbl(seq_along(x_cols), function(k) {
+      (sum(abs(perm_beta[k, ]) >= abs(beta_obs[k])) + 1) / (B + 1)
+    }),
+    perm_sd = apply(perm_beta, 1, sd)
+  )
+}
+
+add_permutation_p <- function(model_results, perm_results) {
+  model_results %>%
+    left_join(perm_results %>% select(term, p_perm), by = "term") %>%
+    mutate(
+      p_perm = ifelse(
+        is.na(p_perm),
+        NA_character_,
+        ifelse(p_perm < .001, "< .001", sprintf("%.4f", p_perm))
+      )
+    )
+}
+
+standardize_finite <- function(x) {
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+  out[ok] <- as.numeric(scale(x[ok]))
+  out
+}
+
+rdm_to_symmetric_matrix <- function(rdm, n_subjects, value_col = "dist") {
+  mat <- matrix(NA_real_, n_subjects, n_subjects)
+  mat[cbind(rdm$var1, rdm$var2)] <- rdm[[value_col]]
+  mat[lower.tri(mat)] <- t(mat)[lower.tri(mat)]
+  diag(mat) <- 0
+  mat
+}
+
+```
+
+## Centrality-Based RDMs
+
+```{r centrality-rdms}
+behav_bribe_rdm <- make_rdm(post_final[bribery_behav])
+behav_control_rdm <- make_rdm(post_final[filler_behav])
+
+network_rdm_list <- map(seq_len(n_net), function(i) {
+  make_rdm(post_final[, net_index_by_net[[i]]])
+})
+names(network_rdm_list) <- network_cats
+
+RDM_merge <- tibble(
+  !!!setNames(map(network_rdm_list, "dist"), network_cols),
+  behav.bribeall = behav_bribe_rdm$dist,
+  behav.filling = behav_control_rdm$dist,
+  var1 = factor(network_rdm_list[[1]]$var1, levels = id_levels),
+  var2 = factor(network_rdm_list[[1]]$var2, levels = id_levels)
+)
+```
+
+```{r centrality-models}
+centrality_bribe_model <- fit_rdm_model(RDM_merge, "behav.bribeall", network_cols)
+centrality_control_model <- fit_rdm_model(RDM_merge, "behav.filling", network_cols)
+
+centrality_bribe_results <- extract_lmer_results(centrality_bribe_model)
+centrality_control_results <- extract_lmer_results(centrality_control_model)
+
+centrality_bribe_results
+centrality_control_results
+```
+
+```{r centrality-permutation}
+centrality_bribe_perm <- RDM_regression_perm(
+  df = RDM_merge,
+  x_cols = network_cols,
+  y_col = "behav.bribeall",
+  B = n_perm_lmer
+)
+
+centrality_control_perm <- RDM_regression_perm(
+  df = RDM_merge,
+  x_cols = network_cols,
+  y_col = "behav.filling",
+  B = n_perm_lmer
+)
+
+centrality_bribe_table <- add_permutation_p(centrality_bribe_results, centrality_bribe_perm)
+centrality_control_table <- add_permutation_p(centrality_control_results, centrality_control_perm)
+
+centrality_bribe_table
+centrality_control_table
+```
+
+## Distance-Based RDMs
+
+```{r distance-rdms}
+graph_distance_rdm <- function(g, ids, mode = "all") {
+  missing_ids <- setdiff(ids, igraph::vertex_attr(g, "name"))
+  if (length(missing_ids) > 0) {
+    stop("These node_id values are missing from the graph: ", paste(missing_ids, collapse = ", "))
+  }
+
+  dmat <- igraph::distances(g, v = ids, to = ids, mode = mode, weights = NA)
+  diag(dmat) <- 0
+
+  as.data.frame(dmat, optional = TRUE) %>%
+    tibble::rownames_to_column("var1_id") %>%
+    pivot_longer(-var1_id, names_to = "var2_id", values_to = "raw_distance") %>%
+    mutate(
+      var1 = match(var1_id, ids),
+      var2 = match(var2_id, ids),
+      raw_distance = as.numeric(raw_distance)
+    ) %>%
+    filter(var1 < var2) %>%
+    arrange(var1, var2)
+}
+
+distance_rdm_raw_list <- map(seq_len(n_net), function(i) {
+  graph_distance_rdm(
+    g = SNmF_igraph[[i]],
+    ids = participant_ids,
+    mode = "all"
+  )
+})
+names(distance_rdm_raw_list) <- network_cats
+
+# Mantel tests use each network's own finite dyads.
+distance_rdm_list_mantel <- map(distance_rdm_raw_list, function(x) {
+  x %>% mutate(dist = standardize_finite(raw_distance))
+})
+
+# Distance-based IS-RSA uses a single common dyad set: remove the union of
+# disconnected dyads across all six networks.
+keep_distance_dyad_isrsa <- Reduce(
+  `&`,
+  map(distance_rdm_raw_list, ~ is.finite(.x$raw_distance))
+)
+
+distance_rdm_list_isrsa <- map(distance_rdm_raw_list, function(x) {
+  x %>%
+    filter(keep_distance_dyad_isrsa) %>%
+    mutate(dist = as.numeric(scale(raw_distance)))
+})
+
+distance_df <- as_tibble(setNames(map(distance_rdm_list_isrsa, "dist"), distance_cols))
+
+behav_bribe_distance_rdm <- make_rdm(post_final[bribery_behav], scale_output = FALSE) %>%
+  filter(keep_distance_dyad_isrsa) %>%
+  mutate(dist = as.numeric(scale(dist)))
+
+behav_control_distance_rdm <- make_rdm(post_final[filler_behav], scale_output = FALSE) %>%
+  filter(keep_distance_dyad_isrsa) %>%
+  mutate(dist = as.numeric(scale(dist)))
+
+RDM_merge_distance <- distance_df %>%
+  mutate(
+    behav.bribeall = behav_bribe_distance_rdm$dist,
+    behav.filling = behav_control_distance_rdm$dist,
+    var1 = factor(distance_rdm_list_isrsa[[1]]$var1, levels = id_levels),
+    var2 = factor(distance_rdm_list_isrsa[[1]]$var2, levels = id_levels)
+  )
+
+distance_missing_summary <- bind_rows(
+  imap(distance_rdm_raw_list, function(x, nm) {
+    tibble(
+      network = nm,
+      network_name = network_names[[nm]],
+      total_dyads = nrow(x),
+      disconnected_dyads = sum(!is.finite(x$raw_distance)),
+      disconnected_prop = disconnected_dyads / total_dyads
+    )
+  })
+)
+
+distance_isrsa_filter_summary <- tibble(
+  total_dyads = length(keep_distance_dyad_isrsa),
+  retained_dyads = sum(keep_distance_dyad_isrsa),
+  removed_union_dyads = sum(!keep_distance_dyad_isrsa),
+  removed_union_prop = removed_union_dyads / total_dyads
+)
+
+distance_missing_summary
+distance_isrsa_filter_summary
+```
+
+```{r distance-models}
+distance_bribe_model <- fit_rdm_model(RDM_merge_distance, "behav.bribeall", distance_cols)
+distance_control_model <- fit_rdm_model(RDM_merge_distance, "behav.filling", distance_cols)
+
+distance_bribe_results <- extract_lmer_results(distance_bribe_model)
+distance_control_results <- extract_lmer_results(distance_control_model)
+
+distance_bribe_results
+distance_control_results
+```
+
+```{r distance-permutation}
+distance_bribe_perm <- RDM_regression_perm(
+  df = RDM_merge_distance,
+  x_cols = distance_cols,
+  y_col = "behav.bribeall",
+  B = n_perm_lmer
+)
+
+distance_control_perm <- RDM_regression_perm(
+  df = RDM_merge_distance,
+  x_cols = distance_cols,
+  y_col = "behav.filling",
+  B = n_perm_lmer
+)
+
+distance_bribe_table <- add_permutation_p(distance_bribe_results, distance_bribe_perm)
+distance_control_table <- add_permutation_p(distance_control_results, distance_control_perm)
+
+distance_bribe_table
+distance_control_table
+```
+
+## Distance-Based Mantel Tests
+
+```{r distance-mantel}
+mantel_one_network <- function(distance_rdm, behavior_rdm, n_subjects, n_perm = 5000,
+                               method = "pearson", seed = seed_value) {
+  distance_mat <- rdm_to_symmetric_matrix(distance_rdm, n_subjects)
+  behavior_mat <- rdm_to_symmetric_matrix(behavior_rdm, n_subjects)
+
+  upper_idx <- upper.tri(distance_mat)
+  keep_obs <- upper_idx & is.finite(distance_mat) & is.finite(behavior_mat)
+  r_obs <- suppressWarnings(cor(distance_mat[keep_obs], behavior_mat[keep_obs], method = method))
+
+  set.seed(seed)
+  perm_r <- replicate(n_perm, {
+    perm_id <- sample.int(n_subjects)
+    behavior_perm <- behavior_mat[perm_id, perm_id]
+    keep_perm <- upper_idx & is.finite(distance_mat) & is.finite(behavior_perm)
+    suppressWarnings(cor(distance_mat[keep_perm], behavior_perm[keep_perm], method = method))
+  })
+
+  tibble(
+    mantel_r = r_obs,
+    p_perm = (sum(abs(perm_r) >= abs(r_obs), na.rm = TRUE) + 1) / (sum(!is.na(perm_r)) + 1),
+    n_perm = n_perm,
+    n_total_cells = sum(upper_idx),
+    n_used_cells = sum(keep_obs),
+    n_removed_cells = sum(upper_idx) - sum(keep_obs)
+  )
+}
+
+behav_bribe_mantel_rdm <- make_rdm(post_final[bribery_behav])
+behav_control_mantel_rdm <- make_rdm(post_final[filler_behav])
+
+mantel_distance_results <- bind_rows(
+  imap(distance_rdm_list_mantel, function(distance_rdm, network_code) {
+    bind_rows(
+      mantel_one_network(distance_rdm, behav_bribe_mantel_rdm, length(participant_ids), n_perm_mantel) %>%
+        mutate(behavior_rdm = "Bribery Behavior RDM"),
+      mantel_one_network(distance_rdm, behav_control_mantel_rdm, length(participant_ids), n_perm_mantel) %>%
+        mutate(behavior_rdm = "Control Behavior RDM")
+    ) %>%
+      mutate(
+        network = network_code,
+        social_network = network_names[[network_code]],
+        .before = 1
+      )
+  })
+)
+
+mantel_distance_results
+```
+
+## Centrality-Behavior Correlation Data
+
+```{r centrality-behavior-correlations}
+
+network_names <- c(
+  "Friendship",
+  "Daily-activity",
+  "Personal life-sharing",
+  "Gossip-sharing",
+  "Positive-cooperation",
+  "Negative-cooperation"
+)
+names(network_names) <- network_cats
+
+centrality_labels <- c(
+  indegree = "In-degree",
+  outdegree = "Out-degree",
+  betweenness = "Betweenness",
+  eigen = "Eigenvector"
+)
+
+behavior_labels <- c(
+  BE = "TT_abs",
+  BE_TP = "TT_pres",
+  BEE = "J_abs",
+  BEE_TP = "J_pres"
+)
+
+cor_method <- "spearman"
+
+cor_with_p <- function(x, y, method = "spearman") {
+  ok <- complete.cases(x, y)
+  x <- x[ok]
+  y <- y[ok]
+
+  if (length(x) < 3 || dplyr::n_distinct(x) < 2 || dplyr::n_distinct(y) < 2) {
+    return(c(r = NA_real_, p = NA_real_))
+  }
+
+  test <- suppressWarnings(cor.test(x, y, method = method, exact = FALSE))
+  c(r = unname(test$estimate), p = test$p.value)
+}
+
+p_to_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "",
+    p < .001 ~ "***",
+    p < .01 ~ "**",
+    p < .05 ~ "*",
+    p < .10 ~ "+",
+    TRUE ~ ""
+  )
+}
+
+network_behavior_correlation <- function(i) {
+  expand.grid(
+    centrality = net_index_by_net[[i]],
+    behavior = bribery_behav,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      cor_stats = map2(centrality, behavior, ~ cor_with_p(post_final[[.x]], post_final[[.y]])),
+      r = map_dbl(cor_stats, "r"),
+      p = map_dbl(cor_stats, "p"),
+      sig = p_to_stars(p),
+      label = ifelse(is.na(r), "", paste0(sprintf("%.2f", r), sig)),
+      network = factor(unname(network_names[i]), levels = unname(network_names)),
+      centrality_type = sub("_[0-9]+$", "", centrality),
+      centrality_type = factor(centrality_type, levels = net_ind, labels = centrality_labels[net_ind]),
+      behavior = factor(behavior, levels = bribery_behav, labels = behavior_labels[bribery_behav])
+    ) %>%
+    select(-cor_stats)
+}
+
+centrality_behavior_cor <- map_dfr(seq_len(n_net), network_behavior_correlation)
+
+stopifnot(nrow(centrality_behavior_cor) == n_net * length(net_ind) * length(bribery_behav))
+
+centrality_behavior_cor
+```
+
+```{r negative-cooperation-summary}
+negative_cooperation_mean_cor <- centrality_behavior_cor %>%
+  filter(network == "Negative-cooperation") %>%
+  summarise(
+    n_correlations = sum(!is.na(r)),
+    mean_r = mean(r, na.rm = TRUE),
+    mean_abs_r = mean(abs(r), na.rm = TRUE),
+    significant_cells = sum(p < .05, na.rm = TRUE)
+  )
+
+negative_cooperation_mean_cor
+```
+
+## Visualization Input
+
+```{r save-visualization-input}
+rsa_plot_data <- list(
+  id_levels = id_levels,
+  network_cats = network_cats,
+  network_names = network_names,
+  network_cols = network_cols,
+  distance_cols = distance_cols,
+  RDM_merge = RDM_merge,
+  behav_bribe_rdm = behav_bribe_rdm,
+  distance_rdm_list_isrsa = distance_rdm_list_isrsa,
+  centrality_behavior_cor = centrality_behavior_cor
+)
+
+saveRDS(rsa_plot_data, file.path(plot_data_dir, "rsa_plot_data.rds"))
+```

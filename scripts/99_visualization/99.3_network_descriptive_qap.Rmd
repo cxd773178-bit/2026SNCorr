@@ -1,0 +1,393 @@
+```{r}
+n_net <- 6
+net_ind <- c("indegree", "outdegree", "betweenness", "eigen")
+bribery_behav <- c("BE", "BE_TP", "BEE", "BEE_TP")
+filler_behav <- c("donate", "RD", "TG", "TPP")
+scaling <- "none"
+output_dir <- file.path("results", "descriptive_qap")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_plot_bundle <- function(plot, stem, width, height, dpi = 300) {
+  svglite::svglite(file.path(output_dir, paste0(stem, ".svg")), width = width, height = height, bg = "transparent")
+  print(plot)
+  grDevices::dev.off()
+  grDevices::cairo_pdf(file.path(output_dir, paste0(stem, ".pdf")), width = width, height = height, family = "Arial")
+  print(plot)
+  grDevices::dev.off()
+  ragg::agg_png(file.path(output_dir, paste0(stem, ".png")), width = width, height = height, units = "in", res = dpi)
+  print(plot)
+  grDevices::dev.off()
+}
+
+source("../0_preprocessing/0.i_import_data.R", local = TRUE)
+SNmF_igraph
+```
+
+## Network Objects
+```{r}
+network_igraphs <- SNmF_igraph
+network_igraphs
+```
+
+## Network Descriptive Statistics
+```{r}
+
+library(igraph)
+library(dplyr)
+library(purrr)
+
+network_labels <- c(
+  "Friendship",
+  "Daily-activity",
+  "Personal life-sharing",
+  "Gossip-sharing",
+  "Positive-cooperation",
+  "Negative-cooperation"
+)
+
+network_descriptive_raw <- map2_dfr(
+  network_labels,
+  network_igraphs,
+  function(label, g) {
+    nominations <- igraph::degree(g, mode = "out", loops = FALSE)
+    tibble(
+      Network = label,
+      Number_of_nodes = igraph::vcount(g),
+      Density = igraph::edge_density(g, loops = FALSE),
+      Mean_nominations = mean(nominations),
+      SD_nominations = sd(nominations),
+      Number_of_ties = igraph::gsize(g)
+    )
+  }
+)
+
+network_descriptive_raw
+```
+
+## Out-degree Range
+```{r}
+library(igraph)
+library(dplyr)
+library(tibble)
+library(purrr)
+
+network_labels <- c(
+  "Friendship",
+  "Daily-activity",
+  "Personal life-sharing",
+  "Gossip-sharing",
+  "Positive-cooperation",
+  "Negative-cooperation"
+)
+
+
+nom_desc <- map2_dfr(1:6, network_labels, function(j, nm) {
+  g <- SNmF_igraph[[j]]
+  outdeg <- igraph::degree(g, mode = "out")
+  
+  tibble(
+    network = nm,
+    Min = min(outdeg, na.rm = TRUE),
+    Max = max(outdeg, na.rm = TRUE)
+  )
+})
+
+nom_desc
+```
+
+## Adjacency Matrices
+```{r}
+library(igraph)
+library(sna)
+
+graph_list <- setNames(
+  SNmF_igraph[seq_along(network_labels)],
+  network_labels
+)
+lapply(graph_list, function(g) igraph::V(g)$name)
+
+adj_list <- lapply(graph_list, function(g) {
+  as.matrix(igraph::as_adjacency_matrix(g, sparse = FALSE))
+})
+```
+
+## QAP Tests
+```{r}
+net_names <- names(adj_list)
+pair_index <- combn(seq_along(adj_list), 2, simplify = FALSE)
+
+set.seed(27)
+
+qap_results <- do.call(rbind, lapply(pair_index, function(idx) {
+  i <- idx[1]
+  j <- idx[2]
+
+  qap_res <- sna::qaptest(
+    list(adj_list[[i]], adj_list[[j]]),
+    sna::gcor,
+    g1 = 1,
+    g2 = 2,
+    reps = 5000
+  )
+
+  r_val <- unname(qap_res$testval)
+  p_val <- (sum(abs(qap_res$dist) >= abs(qap_res$testval)) + 1) / (length(qap_res$dist) + 1)
+
+  data.frame(
+    network1 = net_names[i],
+    network2 = net_names[j],
+    r = round(r_val, 3),
+    p = sprintf("%.4f", p_val)
+  )
+}))
+
+qap_results
+write.csv(qap_results, file.path(output_dir, "qap_results.csv"), row.names = FALSE)
+```
+
+# Fig S2: Within-centrality correlation across networks
+```{r}
+library(ggplot2)
+library(dplyr)
+library(purrr)
+
+network_names <- c(
+  "Friendship",
+  "Daily-activity",
+  "Personal life-sharing",
+  "Gossip-sharing",
+  "Positive-cooperation",
+  "Negative-cooperation"
+)
+
+centrality_labels <- c(
+  indegree = "In-degree",
+  outdegree = "Out-degree",
+  betweenness = "Betweenness",
+  eigen = "Eigenvector"
+)
+
+cor_method <- "spearman"
+
+cor_with_p <- function(x, y, method = "spearman") {
+  ok <- complete.cases(x, y)
+  x <- x[ok]
+  y <- y[ok]
+  
+  if (length(x) < 3 || dplyr::n_distinct(x) < 2 || dplyr::n_distinct(y) < 2) {
+    return(c(r = NA_real_, p = NA_real_))
+  }
+  
+  test <- suppressWarnings(cor.test(x, y, method = method, exact = FALSE))
+  c(r = unname(test$estimate), p = test$p.value)
+}
+
+p_to_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "",
+    p < .001 ~ "***",
+    p < .01 ~ "**",
+    p < .05 ~ "*",
+    
+    TRUE ~ ""
+  )
+}
+
+within_centrality_network_correlation <- function(centrality_type) {
+  centrality_cols <- net_index_by_ind[[centrality_type]]
+  
+  expand.grid(
+    network_x_id = seq_along(centrality_cols),
+    network_y_id = seq_along(centrality_cols),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      centrality_x = centrality_cols[network_x_id],
+      centrality_y = centrality_cols[network_y_id],
+      cor_stats = purrr::map2(
+        centrality_x,
+        centrality_y,
+        ~ cor_with_p(post_final[[.x]], post_final[[.y]], method = cor_method)
+      ),
+      r = purrr::map_dbl(cor_stats, "r"),
+      p = purrr::map_dbl(cor_stats, "p"),
+      p = ifelse(network_x_id == network_y_id, NA_real_, p),
+      sig = p_to_stars(p),
+      label = ifelse(is.na(r), "", paste0(sprintf("%.2f", r), sig)),
+      network_x = factor(
+        network_names[network_x_id],
+        levels = network_names
+      ),
+      network_y = factor(
+        network_names[network_y_id],
+        levels = rev(network_names)
+      ),
+      centrality_type = factor(
+        centrality_type,
+        levels = net_ind,
+        labels = centrality_labels[net_ind]
+      )
+    ) %>%
+    select(centrality_type, network_x_id, network_y_id, network_x, network_y, r, p, sig, label)
+}
+
+within_centrality_network_cor <- purrr::map_dfr(
+  net_ind,
+  within_centrality_network_correlation
+)
+
+within_centrality_network_heatmap <- ggplot(
+  within_centrality_network_cor %>%
+    filter(network_y_id > network_x_id),
+  aes(x = network_x, y = network_y, fill = r)
+) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = label), size = 4) +
+  facet_wrap(~ centrality_type, ncol = 2) +
+  scale_fill_gradient2(
+    low = "#3B6EA8",
+    mid = "white",
+    high = "#B4493F",
+    midpoint = 0,
+    limits = c(-1, 1),
+    na.value = "grey90",
+    name = "Spearman's ρ"
+  ) +
+  coord_equal() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA),
+    strip.background = element_rect(fill = "transparent", color = NA),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "right"
+  )
+
+within_centrality_network_cor
+within_centrality_network_heatmap
+```
+
+## Export Within-centrality Correlation Heatmap
+```{r}
+library(svglite)
+
+save_plot_bundle(
+  within_centrality_network_heatmap,
+  "within_centrality_network_heatmap",
+  width = 10,
+  height = 8
+)
+```
+
+## Fig S2: Within-network correlation across centrality indices
+```{r}
+within_network_centrality_correlation <- function(i) {
+  centrality_cols <- net_index_by_net[[i]]
+  
+  expand.grid(
+    centrality_x_id = seq_along(centrality_cols),
+    centrality_y_id = seq_along(centrality_cols),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      centrality_x = centrality_cols[centrality_x_id],
+      centrality_y = centrality_cols[centrality_y_id],
+      cor_stats = purrr::map2(
+        centrality_x,
+        centrality_y,
+        ~ cor_with_p(post_final[[.x]], post_final[[.y]], method = cor_method)
+      ),
+      r = purrr::map_dbl(cor_stats, "r"),
+      p = purrr::map_dbl(cor_stats, "p"),
+      p = ifelse(centrality_x_id == centrality_y_id, NA_real_, p),
+      sig = p_to_stars(p),
+      label = ifelse(
+        is.na(r),
+        "",
+        paste0(ifelse(sprintf("%.2f", r) == "-0.00", "0.00", sprintf("%.2f", r)), sig)
+      ),
+      centrality_x_type = sub("_[0-9]+$", "", centrality_x),
+      centrality_y_type = sub("_[0-9]+$", "", centrality_y),
+      centrality_x_type = factor(
+        centrality_x_type,
+        levels = net_ind,
+        labels = centrality_labels[net_ind]
+      ),
+      centrality_y_type = factor(
+        centrality_y_type,
+        levels = rev(net_ind),
+        labels = rev(centrality_labels[net_ind])
+      ),
+      network = factor(network_names[i], levels = network_names)
+    ) %>%
+    select(
+      network,
+      centrality_x_id,
+      centrality_y_id,
+      centrality_x_type,
+      centrality_y_type,
+      r,
+      p,
+      sig,
+      label
+    )
+}
+
+within_network_centrality_cor <- purrr::map_dfr(
+  seq_len(n_net),
+  within_network_centrality_correlation
+)
+
+within_network_centrality_heatmap <- ggplot(
+  within_network_centrality_cor %>%
+    filter(centrality_y_id > centrality_x_id),
+  aes(x = centrality_x_type, y = centrality_y_type, fill = r)
+) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = label), size = 4) +
+  facet_wrap(~ network, ncol = 2) +
+  scale_fill_gradient2(
+    low = "#3B6EA8",
+    mid = "white",
+    high = "#B4493F",
+    midpoint = 0,
+    limits = c(-1, 1),
+    na.value = "grey90",
+    name = "Spearman's ρ"
+  ) +
+  coord_equal() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA),
+    strip.background = element_rect(fill = "transparent", color = NA),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "right"
+  )
+
+within_network_centrality_cor
+within_network_centrality_heatmap
+```
+
+## Export Within-network Correlation Heatmap
+```{r}
+save_plot_bundle(
+  within_network_centrality_heatmap,
+  "within_network_centrality_heatmap",
+  width = 7,
+  height = 8
+)
+```
+

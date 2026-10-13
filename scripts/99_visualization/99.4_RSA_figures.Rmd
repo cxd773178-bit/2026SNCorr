@@ -1,0 +1,195 @@
+
+```{r setup, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(svglite)
+
+output_dir <- file.path("results", "rsa")
+plot_data_file <- file.path(output_dir, "rsa_plot_data.rds")
+if (!file.exists(plot_data_file)) {
+  stop("Run ../1_maincode/1.1_RSA_main.Rmd before generating RSA figures.")
+}
+
+rsa_plot_data <- readRDS(plot_data_file)
+list2env(rsa_plot_data, envir = environment())
+network_rdm_names <- setNames(network_names, network_cols)
+```
+
+```{r helper-functions}
+save_plot_bundle <- function(plot, filename, width = 8, height = 8, dpi = 300) {
+  stem <- tools::file_path_sans_ext(filename)
+  svglite::svglite(file.path(output_dir, paste0(stem, ".svg")), width = width, height = height, bg = "transparent")
+  print(plot)
+  grDevices::dev.off()
+  grDevices::cairo_pdf(file.path(output_dir, paste0(stem, ".pdf")), width = width, height = height, family = "Arial")
+  print(plot)
+  grDevices::dev.off()
+  ragg::agg_png(file.path(output_dir, paste0(stem, ".png")), width = width, height = height, units = "in", res = dpi)
+  print(plot)
+  grDevices::dev.off()
+}
+
+make_upper_rdm_data <- function(df, value_cols, value_names) {
+  heat_long <- df %>%
+    select(var1, var2, all_of(value_cols)) %>%
+    pivot_longer(all_of(value_cols), names_to = "rdm", values_to = "dist") %>%
+    mutate(
+      var1 = factor(as.character(var1), levels = id_levels),
+      var2 = factor(as.character(var2), levels = id_levels)
+    )
+
+  diag_data <- expand.grid(
+    var1 = id_levels,
+    var2 = id_levels,
+    rdm = value_cols,
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(var1 == var2) %>%
+    mutate(
+      dist = 0,
+      var1 = factor(var1, levels = id_levels),
+      var2 = factor(var2, levels = id_levels)
+    )
+
+  bind_rows(heat_long, diag_data) %>%
+    filter(as.integer(var1) <= as.integer(var2)) %>%
+    mutate(rdm = factor(value_names[rdm], levels = unname(value_names)))
+}
+
+plot_upper_rdm <- function(plot_data, fill_limits, legend_title) {
+  ggplot(plot_data, aes(x = var2, y = var1, fill = dist)) +
+    geom_tile(color = NA) +
+    scale_fill_gradient2(
+      low = "#6F89A8", mid = "white", high = "#C97845",
+      midpoint = 0, limits = fill_limits, name = legend_title
+    ) +
+    scale_x_discrete(position = "top", limits = id_levels, drop = FALSE) +
+    scale_y_discrete(limits = id_levels, drop = FALSE) +
+    coord_fixed() +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 14, base_family = "Arial") +
+    theme(
+      panel.grid = element_blank(), axis.text = element_blank(),
+      axis.ticks = element_blank(), legend.position = "none",
+      panel.background = element_rect(fill = "transparent", color = NA),
+      plot.background = element_rect(fill = "transparent", color = NA)
+    )
+}
+```
+
+## Centrality-based RDM figures
+
+```{r centrality-rdm-figures}
+network_heat_full <- make_upper_rdm_data(RDM_merge, network_cols, network_rdm_names)
+network_dist_range <- range(network_heat_full$dist, na.rm = TRUE)
+
+network_rdm_plots <- map(setNames(unname(network_rdm_names), network_cats), function(network_label) {
+  plot_upper_rdm(
+    network_heat_full %>% filter(rdm == network_label),
+    network_dist_range,
+    "Euclidean Distance (Z-score)"
+  )
+})
+
+iwalk(network_rdm_plots, function(plot, network_code) {
+  save_plot_bundle(plot, paste0(network_code, "_network_rdm.svg"))
+})
+
+bribe_heat_full <- bind_rows(
+  behav_bribe_rdm %>% mutate(var1 = as.character(var1), var2 = as.character(var2)),
+  expand.grid(var1 = id_levels, var2 = id_levels, stringsAsFactors = FALSE) %>%
+    filter(var1 == var2) %>% mutate(dist = 0)
+) %>%
+  mutate(
+    var1 = factor(var1, levels = id_levels),
+    var2 = factor(var2, levels = id_levels)
+  ) %>%
+  filter(as.integer(var1) <= as.integer(var2))
+
+bribe_network_plot <- plot_upper_rdm(
+  bribe_heat_full,
+  range(bribe_heat_full$dist, na.rm = TRUE),
+  "Euclidean Distance (Z-score)"
+)
+save_plot_bundle(bribe_network_plot, "bribe_network_rdm.svg")
+```
+
+## Distance-based RDM figures
+
+```{r distance-rdm-figures}
+distance_heat_full <- bind_rows(
+  imap(distance_rdm_list_isrsa, function(x, nm) {
+    x %>%
+      select(var1, var2, dist) %>%
+      mutate(rdm = distance_cols[match(nm, network_cats)])
+  })
+) %>%
+  mutate(
+    var1 = factor(as.character(var1), levels = id_levels),
+    var2 = factor(as.character(var2), levels = id_levels)
+  )
+
+distance_diag <- expand.grid(
+  var1 = id_levels, var2 = id_levels, rdm = distance_cols,
+  stringsAsFactors = FALSE
+) %>%
+  filter(var1 == var2) %>%
+  mutate(
+    dist = 0,
+    var1 = factor(var1, levels = id_levels),
+    var2 = factor(var2, levels = id_levels)
+  )
+
+distance_heat_full <- bind_rows(distance_heat_full, distance_diag) %>%
+  filter(as.integer(var1) <= as.integer(var2)) %>%
+  mutate(
+    rdm = factor(
+      network_rdm_names[sub("^distance", "network", rdm)],
+      levels = unname(network_rdm_names)
+    )
+  )
+
+distance_dist_range <- range(distance_heat_full$dist, na.rm = TRUE)
+distance_rdm_plots <- map(setNames(unname(network_names), network_cats), function(network_label) {
+  plot_upper_rdm(
+    distance_heat_full %>% filter(rdm == network_label),
+    distance_dist_range,
+    "Shortest-path Distance (Z-score)"
+  )
+})
+
+iwalk(distance_rdm_plots, function(plot, network_code) {
+  save_plot_bundle(plot, paste0(network_code, "_distance_rdm.svg"))
+})
+```
+
+## Centrality-behavior correlation heatmap
+
+```{r centrality-behavior-heatmap}
+centrality_behavior_heatmap <- ggplot(
+  centrality_behavior_cor,
+  aes(x = behavior, y = centrality_type, fill = r)
+) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = label), size = 4) +
+  facet_wrap(~ network, ncol = 2) +
+  scale_fill_gradient2(
+    low = "#3B6EA8", mid = "white", high = "#B4493F",
+    midpoint = 0, limits = c(-1, 1), na.value = "grey90",
+    name = "Spearman's ρ"
+  ) +
+  coord_equal() +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "right"
+  )
+
+save_plot_bundle(centrality_behavior_heatmap, "centrality_behavior_heatmap.svg", width = 7, height = 8)
+```
